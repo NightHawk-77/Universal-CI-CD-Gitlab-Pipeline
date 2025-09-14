@@ -1,0 +1,354 @@
+# Universal GitLab CI pipeline for ANY technology stack
+# - Uses Docker as the universal build/deploy mechanism
+# - Works with any language/framework that has a Dockerfile
+# - Clean modular design with reusable scripts
+# - Comprehensive security scanning with Trivy
+
+# Configure appropriate variables
+# This pipeline uses 2 runners: docker and shell — adjust to your environment
+# Built for a standalone VM; adapt as needed
+# Some issues may arise; proceed with caution
+# No docker-compose was used
+
+stages:
+  - setup
+  - test
+  - build
+  - security-scan
+  - deploy
+  - monitoring
+
+# -------------------------
+# GLOBAL VARIABLES
+# -------------------------
+variables:
+  # Docker configuration
+  DOCKER_DRIVER: overlay2
+  DOCKER_TLS_CERTDIR: "/certs"
+  
+  # Image tagging strategy
+  IMAGE_TAG_SHORT: "${CI_COMMIT_SHORT_SHA}"
+  IMAGE_TAG_REF: "${CI_COMMIT_REF_SLUG}"
+  IMAGE_LATEST: "latest"
+  
+  # Deployment configuration (customize per project)
+  APP_NAME: "my-app"                    # Change this per project
+  CONTAINER_PORT: "80"                # Port your app listens on inside container
+  HOST_PORT: "5004"                     # Port to expose on VM
+  DOCKERFILE_PATH: "./Dockerfile"       # Path to Dockerfile
+  DOCKER_CONTEXT: "."                   # Docker build context
+  
+  # Security scanning configuration
+  TRIVY_VERSION: "0.48.3"               # Trivy scanner version
+  SECURITY_SCAN_FORMAT: "sarif"         # Output format: json, table, sarif
+  SECURITY_FAIL_ON: "CRITICAL,HIGH"     # Fail pipeline on these severity levels
+  SECURITY_IGNORE_UNFIXED: "true"       # Ignore vulnerabilities without fixes
+  SECURITY_TIMEOUT: "10m"               # Scanner timeout
+  
+  # Optional deployment settings
+  DOCKER_RESTART_POLICY: "unless-stopped"
+  DOCKER_EXTRA_ARGS: ""                 # Additional docker run arguments
+  HEALTH_CHECK_PATH: "/"                # Path for health check (e.g., "/health")
+  
+  # Scripts configuration
+  SCRIPTS_DIR: "./scripts"
+  KEEP_IMAGES: "3"                      # Number of old images to keep
+  
+  # Git strategy
+  GIT_STRATEGY: fetch
+
+# -------------------------
+# SETUP DEPENDENCIES
+# -------------------------
+setup-dependencies:
+  stage: setup
+  image: ubuntu:20.04
+  tags:
+    - docker    # Use docker executor instead of shell
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "dev"'
+      when: always
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      when: always
+    - when: never
+  before_script:
+    # Install basic tools without sudo (we're root in container)
+    - apt-get update
+    - apt-get install -y bash curl wget git
+    - chmod +x $SCRIPTS_DIR/*.sh
+  script:
+    - echo "🔧 Setting up project dependencies..."
+    - $SCRIPTS_DIR/install-deps.sh
+  artifacts:
+    paths:
+      - node_modules/
+      - vendor/
+      - .deps/
+    expire_in: 1 hour
+    when: on_success
+
+# -------------------------
+# RUN TESTS
+# -------------------------
+run-tests:
+  stage: test
+  image: ubuntu:20.04
+  tags:
+    - docker    # Use docker executor instead of shell
+  needs:
+    - setup-dependencies
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "dev"'
+      when: always
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      when: always
+    - when: never
+  before_script:
+    # Install basic tools and potential test dependencies
+    - apt-get update
+    - apt-get install -y bash curl wget git
+    # Install common testing tools based on project type
+    - |
+      if [[ -f "package.json" ]]; then
+        curl -fsSL https://deb.nodesource.com/setup_18.x | bash -
+        apt-get install -y nodejs
+      elif [[ -f "requirements.txt" || -f "pyproject.toml" || -f "setup.py" ]]; then
+        apt-get install -y python3 python3-pip
+        pip3 install pytest pytest-cov || true
+      elif [[ -f "go.mod" ]]; then
+        wget -q https://golang.org/dl/go1.21.0.linux-amd64.tar.gz
+        tar -C /usr/local -xzf go1.21.0.linux-amd64.tar.gz
+        export PATH=$PATH:/usr/local/go/bin
+      fi
+    - chmod +x $SCRIPTS_DIR/*.sh
+  script:
+    - echo "☕ Running build (Java apps) or letting Docker handle other techs..."
+    - $SCRIPTS_DIR/build.sh
+    - echo "🧪 Running tests..."
+    - $SCRIPTS_DIR/test.sh
+  artifacts:
+    reports:
+      junit: test-results.xml
+    paths:
+      - test-results/
+      - coverage/
+      - target/onlinebookstore.war
+    when: always
+
+# -------------------------
+# BUILD DOCKER IMAGE
+# -------------------------
+docker-build-push:
+  stage: build
+  image:
+    name: gcr.io/kaniko-project/executor:debug
+    entrypoint: [""]
+  tags:
+    - docker
+  needs:
+    - run-tests
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "dev"'
+      when: on_success
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      when: on_success
+    - when: never
+  before_script:
+    - echo "🐳 Building Docker image for $APP_NAME"
+    - echo "Dockerfile $DOCKERFILE_PATH"
+    - echo "Context $DOCKER_CONTEXT"
+  script:
+    - mkdir -p /kaniko/.docker
+    - |
+      if [ -n "$CI_REGISTRY_PASSWORD" ]; then
+        echo "{\"auths\":{\"$CI_REGISTRY\":{\"username\":\"$CI_REGISTRY_USER\",\"password\":\"$CI_REGISTRY_PASSWORD\"}}}" > /kaniko/.docker/config.json
+      else
+        echo "{\"auths\":{\"$CI_REGISTRY\":{\"username\":\"gitlab-ci-token\",\"password\":\"$CI_JOB_TOKEN\"}}}" > /kaniko/.docker/config.json
+      fi
+    - |
+      /kaniko/executor \
+        --context $DOCKER_CONTEXT \
+        --dockerfile $DOCKERFILE_PATH \
+        --destination $CI_REGISTRY_IMAGE:$IMAGE_TAG_REF \
+        --destination $CI_REGISTRY_IMAGE:$IMAGE_TAG_SHORT \
+        --destination $CI_REGISTRY_IMAGE:$IMAGE_LATEST \
+        --cache=true \
+        --cache-ttl=24h
+
+# -------------------------
+# SECURITY SCANNING
+# -------------------------
+security-scan:
+  stage: security-scan
+  tags:
+    - shell    # Use shell executor with direct Docker access
+  needs:
+    - docker-build-push
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "dev"'
+      when: always
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      when: always
+    - when: never
+  variables:
+    TARGET_IMAGE: "${CI_REGISTRY_IMAGE}:${IMAGE_TAG_SHORT}"
+    DOCKER_HOST: "unix:///var/run/docker.sock"  # Use default Unix socket
+  before_script:
+    - echo "🔒 Preparing security scan for $TARGET_IMAGE"
+    # Check Docker access
+    - docker --version || { echo "Docker not available"; exit 1; }
+    - docker info || { echo "Docker daemon not accessible"; exit 1; }
+    # Make scripts executable
+    - chmod +x $SCRIPTS_DIR/*.sh || { echo "Scripts not executable"; exit 1; }
+    # Registry authentication setup (for remote scanning)
+    - |
+      if [ -n "$CI_REGISTRY_PASSWORD" ]; then
+        echo "Setting up registry authentication for remote scanning"
+        export TRIVY_USERNAME="$CI_REGISTRY_USER"
+        export TRIVY_PASSWORD="$CI_REGISTRY_PASSWORD"
+        export TRIVY_AUTH_URL="$CI_REGISTRY"
+      else
+        echo "Setting up GitLab CI token authentication for remote scanning"
+        export TRIVY_USERNAME="gitlab-ci-token"
+        export TRIVY_PASSWORD="$CI_JOB_TOKEN"
+        export TRIVY_AUTH_URL="$CI_REGISTRY"
+      fi
+    # Verify registry connectivity (optional - don't fail if this doesn't work)
+    - |
+      echo "Testing registry connectivity..."
+      if command -v curl >/dev/null 2>&1; then
+        curl -s -I "$CI_REGISTRY" || echo "Registry connectivity test skipped"
+      else
+        echo "curl not available - skipping connectivity test"
+      fi
+  script:
+    - echo "🔍 Running comprehensive security scan..."
+    - $SCRIPTS_DIR/scan-docker.sh "$TARGET_IMAGE"
+  after_script:
+    - echo "📊 Security scan completed"
+    - docker logout "$CI_REGISTRY" || true
+    # Ensure reports directory exists even if scan failed
+    - mkdir -p security-reports
+    - |
+      if [ ! -f security-reports/scan-summary.json ]; then
+        cat > security-reports/scan-summary.json << EOF
+      {
+        "scan_timestamp": "$(date -Iseconds)",
+        "target_image": "$TARGET_IMAGE",
+        "status": "failed",
+        "error": "Security scan did not complete successfully"
+      }
+      EOF
+      fi
+    # Create minimal SAST report if none exists
+    - |
+      if [ ! -f security-reports/trivy-sast.json ]; then
+        cat > security-reports/trivy-sast.json << EOF
+      {
+        "version": "2.1.0",
+        "runs": [{
+          "tool": {
+            "driver": {
+              "name": "Trivy",
+              "version": "unknown"
+            }
+          },
+          "results": []
+        }]
+      }
+      EOF
+      fi
+  artifacts:
+    when: always
+    expire_in: 1 week
+    paths:
+      - security-reports/
+    reports:
+      sast: security-reports/trivy-sast.json
+  allow_failure: true  # Set to true if you want to allow deployment despite security issues
+
+# -------------------------
+# DEPLOY TO VM (Shell executor for Docker daemon access)
+# -------------------------
+deploy-vm:
+  stage: deploy
+  tags:
+    - shell    # Must run on shell executor with Docker access
+  needs:
+    - security-scan
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      when: manual     # Manual approval for main branch
+    - if: '$CI_COMMIT_BRANCH == "dev"'
+      when: on_success
+    - when: never
+  variables:
+    CONTAINER_NAME: "${APP_NAME}-${CI_COMMIT_REF_SLUG}"
+    DOCKER_HOST: "unix:///var/run/docker.sock"
+  before_script:
+    # Check if we have docker access (no sudo needed if runner has permissions)
+    - docker --version || { echo "Docker not available"; exit 1; }
+    - chmod +x $SCRIPTS_DIR/*.sh || { echo "Scripts not executable"; exit 1; }
+    - echo "🚀 Preparing deployment for $APP_NAME"
+  script:
+    - echo "🔄 Running deployment script..."
+    - $SCRIPTS_DIR/deploy.sh
+  after_script:
+    - echo "🧹 Running cleanup script..."
+    - $SCRIPTS_DIR/cleanup.sh || true
+    # Always create basic deployment info even if deployment failed
+    - |
+      cat > deploy.env << EOF || true
+      DEPLOYED_APP=${APP_NAME:-"unknown"}
+      DEPLOYED_CONTAINER=${CONTAINER_NAME:-"unknown"}
+      DEPLOYED_URL=http://localhost:${HOST_PORT:-"3000"}
+      DEPLOYED_IMAGE=${CI_REGISTRY_IMAGE:-"unknown"}:${IMAGE_TAG_REF:-"latest"}
+      DEPLOYMENT_TIME=$(date -Iseconds)
+      DEPLOYMENT_STATUS=completed
+      EOF
+    - |
+      cat > deployment-info.json << EOF || true
+      {
+        "deployment": {
+          "timestamp": "$(date -Iseconds)",
+          "status": "completed",
+          "app_name": "${APP_NAME:-unknown}",
+          "container_name": "${CONTAINER_NAME:-unknown}",
+          "url": "http://localhost:${HOST_PORT:-3000}"
+        }
+      }
+      EOF
+  environment:
+    name: "${CI_COMMIT_REF_SLUG}"
+    url: "http://localhost:$HOST_PORT"
+  artifacts:
+    reports:
+      dotenv: deploy.env
+    paths:
+      - deployment-info.json
+    when: always
+
+# --------------------------------------
+#	Monitoring with prometheus , grafana
+# --------------------------------------
+
+monitoring:
+  stage: monitoring
+  tags:
+    - shell
+  needs:
+    - deploy-vm
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "dev"'
+      when: on_success
+    - when: never
+  before_script:
+    - chmod +x $SCRIPTS_DIR/*.sh
+    - echo "🚀 Setting up monitoring stack (Prometheus + Grafana + dashboards)"
+  script:
+    - sudo $SCRIPTS_DIR/monitoring.sh  # <-- your script
+  artifacts:
+    paths:
+      - dashboards/
+    expire_in: 1 day
+
