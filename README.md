@@ -1,9 +1,9 @@
-# 🚀 Universal GitLab CI/CD Pipeline
+# Universal GitLab CI/CD Pipeline
 
 This project provides a universal GitLab CI/CD pipeline that works with any technology stack using Docker as the deployment mechanism.
 It includes automated testing, security scanning, deployment, and monitoring with Prometheus and Grafana.
 
-## 📂 Pipeline Configuration
+##  Pipeline Configuration
 
 Key variables in `.gitlab-ci.yml`:
 
@@ -13,7 +13,7 @@ Key variables in `.gitlab-ci.yml`:
 - `SECURITY_FAIL_ON`: "CRITICAL,HIGH" 
 - `TRIVY_VERSION`: "0.48.3"        
 
-## ⚙️ Scripts
+##  Scripts
 
 All pipeline logic is located in the `./scripts/` directory:
 
@@ -33,7 +33,7 @@ All pipeline logic is located in the `./scripts/` directory:
 - `monitoring.sh` → Sets up Prometheus & Grafana
 - `nginx-certbot.sh` → Configures Nginx + Certbot for SSL
 
-## 📌 Requirements
+##  Requirements
 
 To run this pipeline, ensure the following:
 
@@ -41,13 +41,13 @@ To run this pipeline, ensure the following:
 - Docker installed on the target VM
 - Network access to your container registry
 
-## ⚠️ Important Notes
+## Important Notes
 
 - SSL Setup → Requires manual execution of `nginx-certbot.sh`
 - Database Connections → Must be configured manually
 - Deployment Scope → Designed for single-machine/VM deployments only
 
-## 📊 Monitoring Setup
+##  Monitoring Setup
 
 This project includes Prometheus + Grafana integration.
 Metrics are collected from:
@@ -57,7 +57,7 @@ Metrics are collected from:
 - Node Exporter
 - cAdvisor (for container monitoring)
 
-## 📝 Summary
+## Summary
 
 - Build → Test → Scan → Deploy → Monitor
 - Technology-agnostic and reusable pipeline
